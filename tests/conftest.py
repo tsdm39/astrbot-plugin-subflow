@@ -7,11 +7,19 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+import nonebot
 import pytest
 import pytest_asyncio
 
-from nonebot_plugin_subflow.config import load_env_file
-from nonebot_plugin_subflow.storage import TencentDocStorage
+# 初始化 NoneBot driver，让插件可以被 import；on_startup/on_shutdown 不会自动触发，
+# 所以 deps 不会真的初始化，单元测试该有的 monkeypatch / 显式构造仍走自己的路径。
+try:
+    nonebot.get_driver()
+except ValueError:
+    nonebot.init()
+
+from nonebot_plugin_subflow.config import load_env_file  # noqa: E402
+from nonebot_plugin_subflow.storage import TencentDocStorage  # noqa: E402
 
 
 SPIKE_ENV_PATH = Path(__file__).resolve().parents[1] / "spike" / ".env.spike"

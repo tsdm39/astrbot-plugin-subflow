@@ -1,0 +1,421 @@
+"""render.py 单元测试 — 纯函数，不需要起 NoneBot。"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from nonebot.adapters.onebot.v11 import Message, MessageSegment
+
+from nonebot_plugin_subflow.models import BindingEntry, Record
+from nonebot_plugin_subflow.pipeline import parse_dsl
+from nonebot_plugin_subflow.render import (
+    assignee_segment,
+    render_abandon,
+    render_archive,
+    render_available,
+    render_bindings_list,
+    render_claim,
+    render_complete,
+    render_create_episode,
+    render_delete_done,
+    render_delete_summary,
+    render_in_progress,
+    render_my_tasks,
+    render_pipeline_view,
+    render_progress,
+    render_update,
+)
+from nonebot_plugin_subflow.task_manager import (
+    COL_ASSIGNEE,
+    COL_DONE_TIME,
+    COL_EPISODE,
+    COL_PROGRESS,
+    COL_REMARK,
+    COL_SEGMENT,
+    COL_TYPE,
+    PROGRESS_ASSIGNED,
+    PROGRESS_DONE,
+    PROGRESS_UNASSIGNED,
+    SEGMENT_WHOLE,
+    AbandonOutcome,
+    ArchiveOutcome,
+    ClaimOutcome,
+    CompleteOutcome,
+    CreateEpisodeOutcome,
+    DeleteOutcome,
+    DeleteSummary,
+    InProgressOutcome,
+    TaskRef,
+    UpdateOutcome,
+)
+
+
+# ============================================================ assignee_segment
+
+
+def test_assignee_segment_qq_number_becomes_at() -> None:
+    seg = assignee_segment("12345")
+    assert seg.type == "at"
+    # OneBot v11 把 qq 存为字符串
+    assert str(seg.data["qq"]) == "12345"
+
+
+def test_assignee_segment_nickname_becomes_text() -> None:
+    seg = assignee_segment("小明同学")
+    assert seg.type == "text"
+    assert seg.data["text"] == "小明同学"
+
+
+def test_assignee_segment_empty_returns_question() -> None:
+    seg = assignee_segment("")
+    assert seg.type == "text"
+    assert seg.data["text"] == "?"
+
+
+# ============================================================ task ops
+
+
+def _make_record(**values) -> Record:
+    defaults = {
+        COL_TYPE: "翻译",
+        COL_EPISODE: "07",
+        COL_SEGMENT: "P1（0-8）",
+        COL_ASSIGNEE: "100",
+        COL_PROGRESS: PROGRESS_ASSIGNED,
+        COL_REMARK: "",
+    }
+    defaults.update(values)
+    return Record(record_id="r1", values=defaults)
+
+
+def _ref(stage: str = "翻译", segment: str = "P1（0-8）") -> TaskRef:
+    return TaskRef(show="淡岛百景", episode="07", stage=stage, segment=segment)
+
+
+def test_render_claim_includes_at_and_label() -> None:
+    msg = render_claim(ClaimOutcome(task=_make_record(), ref=_ref()))
+    text = str(msg)
+    assert "[CQ:at,qq=100]" in text
+    assert "淡岛百景07 翻译 P1（0-8）" in text
+    assert "✅" in text
+
+
+def test_render_complete_normal_path_no_warning() -> None:
+    outcome = CompleteOutcome(
+        task=_make_record(**{COL_PROGRESS: PROGRESS_DONE}),
+        ref=_ref(),
+        sender_qq=100,
+        original_assignee_raw="100",
+        sender_was_assignee=True,
+        same_stage_remaining=0,
+        newly_unlocked_stages=[],
+        blocking_stages=[],
+    )
+    text = str(render_complete(outcome))
+    assert "完成了" in text
+    assert "⚠️" not in text  # 正常路径无提醒
+
+
+def test_render_complete_non_assignee_qq_warning() -> None:
+    """D3: 发送者≠组员且组员是QQ → 提示带 @"""
+    outcome = CompleteOutcome(
+        task=_make_record(),
+        ref=_ref(),
+        sender_qq=999,
+        original_assignee_raw="100",
+        sender_was_assignee=False,
+        same_stage_remaining=0,
+        newly_unlocked_stages=[],
+        blocking_stages=[],
+    )
+    text = str(render_complete(outcome))
+    assert "⚠️" in text
+    assert "你不是该任务的当前组员" in text
+    assert "[CQ:at,qq=100]" in text
+
+
+def test_render_complete_non_assignee_nickname_warning() -> None:
+    """D3: 发送者≠组员且组员是昵称 → 文本提示，不 @"""
+    outcome = CompleteOutcome(
+        task=_make_record(),
+        ref=_ref(),
+        sender_qq=999,
+        original_assignee_raw="小明同学",
+        sender_was_assignee=False,
+        same_stage_remaining=0,
+        newly_unlocked_stages=[],
+        blocking_stages=[],
+    )
+    text = str(render_complete(outcome))
+    assert "⚠️" in text
+    assert "「小明同学」承担" in text
+    assert "CQ:at" not in text.replace("[CQ:at,qq=999]", "")  # 没有别的 at
+
+
+def test_render_complete_with_remaining_segments() -> None:
+    outcome = CompleteOutcome(
+        task=_make_record(),
+        ref=_ref(),
+        sender_qq=100,
+        original_assignee_raw="100",
+        sender_was_assignee=True,
+        same_stage_remaining=2,
+        newly_unlocked_stages=[],
+        blocking_stages=[],
+    )
+    text = str(render_complete(outcome))
+    assert "翻译 还剩 2 个分段未完成" in text
+
+
+def test_render_complete_with_newly_unlocked() -> None:
+    outcome = CompleteOutcome(
+        task=_make_record(),
+        ref=_ref(),
+        sender_qq=100,
+        original_assignee_raw="100",
+        sender_was_assignee=True,
+        same_stage_remaining=0,
+        newly_unlocked_stages=["校对"],
+        blocking_stages=[],
+    )
+    text = str(render_complete(outcome))
+    assert "🎉" in text
+    assert "校对 现在可以接了" in text
+    assert "/接活 淡岛百景 07 校对" in text
+
+
+def test_render_complete_with_blocking_stages_when_no_unlock() -> None:
+    """同工序全完成但下游仍有别的前置未完成 → 信息性提示"""
+    outcome = CompleteOutcome(
+        task=_make_record(),
+        ref=_ref(),
+        sender_qq=100,
+        original_assignee_raw="100",
+        sender_was_assignee=True,
+        same_stage_remaining=0,
+        newly_unlocked_stages=[],
+        blocking_stages=["校对"],
+    )
+    text = str(render_complete(outcome))
+    assert "翻译 已全部完成" in text
+    assert "等待其它前置完成后" in text
+
+
+def test_render_abandon_with_warning() -> None:
+    outcome = AbandonOutcome(
+        task=_make_record(**{COL_PROGRESS: PROGRESS_UNASSIGNED, COL_ASSIGNEE: ""}),
+        ref=_ref(),
+        sender_qq=999,
+        original_assignee_raw="100",
+        sender_was_assignee=False,
+    )
+    text = str(render_abandon(outcome))
+    assert "放弃了" in text
+    assert "⚠️" in text
+
+
+def test_render_in_progress_includes_at() -> None:
+    text = str(
+        render_in_progress(
+            InProgressOutcome(task=_make_record(), ref=_ref())
+        )
+    )
+    assert "开始" in text
+    assert "[CQ:at,qq=100]" in text
+
+
+def test_render_update_lists_changes() -> None:
+    outcome = UpdateOutcome(
+        task=_make_record(),
+        ref=_ref(),
+        changed_fields={COL_REMARK: "加急"},
+    )
+    text = str(render_update(outcome))
+    assert "已更新" in text
+    assert "备注=加急" in text
+
+
+# ============================================================ episode ops
+
+
+def test_render_create_episode_announcement() -> None:
+    inserted = [
+        _make_record(**{COL_TYPE: "翻译", COL_SEGMENT: f"P{i}（...）"})
+        for i in range(1, 4)
+    ] + [
+        _make_record(**{COL_TYPE: "校对", COL_SEGMENT: SEGMENT_WHOLE}),
+        _make_record(**{COL_TYPE: "压制", COL_SEGMENT: SEGMENT_WHOLE}),
+    ]
+    outcome = CreateEpisodeOutcome(
+        show="淡岛百景",
+        episode="07",
+        inserted=inserted,
+        initial_unlocked_stages=["翻译"],
+    )
+    text = render_create_episode(outcome)
+    assert "淡岛百景 第07集" in text
+    assert "5 条" in text
+    assert "翻译×3" in text
+    assert "校对" in text  # 单条不带数量后缀
+    assert "当前可接：翻译" in text
+
+
+def test_render_delete_summary_lists_active_tasks() -> None:
+    matched = [
+        _make_record(**{COL_PROGRESS: PROGRESS_ASSIGNED, COL_ASSIGNEE: "100"}),
+        _make_record(**{COL_PROGRESS: PROGRESS_UNASSIGNED, COL_ASSIGNEE: ""}),
+    ]
+    summary = DeleteSummary(
+        show="淡岛百景",
+        episode="07",
+        matched=matched,
+        expires_at=datetime(2026, 5, 26, 18, 0, 30),
+        overwrote_previous=False,
+    )
+    text = render_delete_summary(summary)
+    assert "即将删除" in text
+    assert "共 2 条" in text
+    assert "1 条已分配/进行中" in text
+    assert "确认删除" in text
+
+
+def test_render_delete_summary_overwrite_note() -> None:
+    summary = DeleteSummary(
+        show="X",
+        episode="07",
+        matched=[_make_record(**{COL_PROGRESS: PROGRESS_UNASSIGNED, COL_ASSIGNEE: ""})],
+        expires_at=datetime(2026, 5, 26, 18, 0, 30),
+        overwrote_previous=True,
+    )
+    assert "已覆盖" in render_delete_summary(summary)
+
+
+def test_render_delete_done() -> None:
+    outcome = DeleteOutcome(
+        show="X", episode="07", deleted=[_make_record(), _make_record()]
+    )
+    text = render_delete_done(outcome)
+    assert "已删除" in text
+    assert "2 条" in text
+
+
+def test_render_archive_outcome() -> None:
+    outcome = ArchiveOutcome(
+        show="X",
+        episode="07",
+        archived=[_make_record(), _make_record()],
+        skipped=[_make_record()],
+    )
+    text = render_archive(outcome)
+    assert "归档完成" in text
+    assert "2 条" in text
+    assert "1 条非已完成" in text
+
+
+# ============================================================ progress board
+
+
+def test_render_progress_includes_all_columns_in_pipeline_order() -> None:
+    records = [
+        _make_record(**{
+            COL_TYPE: "翻译",
+            COL_SEGMENT: "P1（0-8）",
+            COL_PROGRESS: PROGRESS_DONE,
+            COL_DONE_TIME: datetime(2026, 5, 20, 18, 0),
+            COL_ASSIGNEE: "100",
+        }),
+        _make_record(**{
+            COL_TYPE: "翻译",
+            COL_SEGMENT: "P2（8-16）",
+            COL_PROGRESS: PROGRESS_UNASSIGNED,
+            COL_ASSIGNEE: "",
+        }),
+        _make_record(**{
+            COL_TYPE: "校对",
+            COL_SEGMENT: SEGMENT_WHOLE,
+            COL_PROGRESS: PROGRESS_UNASSIGNED,
+            COL_ASSIGNEE: "",
+        }),
+    ]
+    text = render_progress("淡岛百景", "07", records)
+    assert "淡岛百景 第07集" in text
+    assert "翻译" in text
+    assert "校对" in text
+    assert "@100" in text  # 已分配的展示 @
+    assert "05-20" in text  # 完成时间月日
+    # 翻译应在校对之前出现
+    assert text.index("翻译") < text.index("校对")
+
+
+def test_render_progress_empty_records_shows_placeholder() -> None:
+    text = render_progress("X", "99", [])
+    assert "暂无任务记录" in text
+
+
+# ============================================================ list / bindings
+
+
+def test_render_my_tasks_with_entries() -> None:
+    tasks = [
+        ("淡岛百景", _make_record(**{COL_TYPE: "翻译", COL_SEGMENT: "P1（0-8）"})),
+        ("孤独摇滚", _make_record(**{COL_TYPE: "时轴", COL_SEGMENT: SEGMENT_WHOLE})),
+    ]
+    text = render_my_tasks(100, tasks)
+    assert "@100" in text
+    assert "淡岛百景" in text
+    assert "孤独摇滚" in text
+
+
+def test_render_my_tasks_empty() -> None:
+    assert "🎉" in render_my_tasks(100, [])
+
+
+def test_render_available_emits_commands() -> None:
+    tasks = [
+        ("淡岛百景", _make_record(**{
+            COL_TYPE: "翻译",
+            COL_SEGMENT: "P1（0-8）",
+            COL_ASSIGNEE: "",
+            COL_PROGRESS: PROGRESS_UNASSIGNED,
+        })),
+    ]
+    text = render_available(tasks)
+    assert "/接活 淡岛百景 07 翻译 P1（0-8）" in text
+
+
+def test_render_available_empty() -> None:
+    assert "暂无可接任务" in render_available([])
+
+
+def test_render_bindings_list() -> None:
+    entries = [
+        BindingEntry(
+            alias="淡岛百景",
+            group_id=111,
+            file_id="F",
+            sheet_id="S",
+            bound_by=987,
+            bound_at=datetime(2026, 5, 25, 14, 0),
+        )
+    ]
+    text = render_bindings_list(entries, title="本群绑定的番剧")
+    assert "共 1 项" in text
+    assert "淡岛百景" in text
+    assert "111" in text
+
+
+def test_render_bindings_list_empty() -> None:
+    assert "空" in render_bindings_list([], title="X")
+
+
+def test_render_pipeline_view_marks_default() -> None:
+    pipeline = parse_dsl("翻译 → 校对")
+    text = render_pipeline_view("淡岛百景", pipeline, is_default=True)
+    assert "默认流水线" in text
+    assert "翻译 → 校对" in text
+
+
+def test_render_pipeline_view_marks_custom() -> None:
+    pipeline = parse_dsl("翻译 → 校对")
+    text = render_pipeline_view("淡岛百景", pipeline, is_default=False)
+    assert "自定义流水线" in text

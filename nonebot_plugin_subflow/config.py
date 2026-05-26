@@ -1,7 +1,8 @@
-"""M1 阶段的最小配置读取。
+"""配置层。
 
-故意不引入 pydantic-settings：M4 接入 NoneBot2 后，会换成 NoneBot 标准的 Config 模型，
-本模块只在脱离 NoneBot 跑测试时使用。
+两种用法：
+1. 在 NoneBot2 里跑：用 `Config` 模型 + `nonebot.get_plugin_config(Config)` 读取
+2. 脱离 NoneBot 跑（如集成测试 spike/.env.spike）：用 `load_env_file` + `load_tencent_creds`
 """
 
 from __future__ import annotations
@@ -9,6 +10,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+from pydantic import BaseModel, Field
 
 
 @dataclass
@@ -46,4 +49,28 @@ def load_tencent_creds(env_file: Path | None = None) -> TencentCreds:
         client_id=_get("TENCENT_DOC_CLIENT_ID"),
         open_id=_get("TENCENT_DOC_OPEN_ID"),
         access_token=_get("TENCENT_DOC_ACCESS_TOKEN"),
+    )
+
+
+class Config(BaseModel):
+    """NoneBot 插件配置。所有字段从 .env / 环境变量读取。"""
+
+    # ──── 腾讯文档 API ────
+    tencent_doc_client_id: str
+    tencent_doc_open_id: str
+    tencent_doc_access_token: str
+    tencent_doc_default_file_id: str = ""  # 默认文档 ID（未来按名绑定时查找子表用），M4 暂不强制
+
+    # ──── 群配置 ────
+    subflow_main_group_id: int | None = None
+    subflow_admin_qq_list: list[int] = Field(default_factory=list)
+
+    # ──── 业务参数 ────
+    subflow_max_tasks_per_user: int = 5
+    subflow_sync_interval: int = 30  # 分钟
+    subflow_confirm_timeout: int = 30  # 秒
+    subflow_token_warn_days: int = 7  # 天
+    subflow_data_dir: str = "./data"
+    subflow_default_pipeline: str = (
+        "翻译[分段],时轴[分段] → 校对 → 后期 → 监制 → 压制"
     )
