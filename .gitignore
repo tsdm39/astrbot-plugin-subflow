@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AI
+.claude/
+
+# Spike scratch credentials — NEVER commit
+spike/.env*
+spike/secrets.*
+spike/last_response.json
