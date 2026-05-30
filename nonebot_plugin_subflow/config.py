@@ -10,8 +10,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 @dataclass
@@ -74,3 +75,26 @@ class Config(BaseModel):
     subflow_default_pipeline: str = (
         "翻译[分段] → 时轴[分段] → 校对 → 后期 → 监制 → 压制"
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _empty_str_to_none(cls, data: Any) -> Any:
+        """.env 中 KEY= 得空字符串；对非 str 类型字段转为 None 以触发 Pydantic 默认值回退。"""
+        if not isinstance(data, dict):
+            return data
+        _STR_FIELD_NAMES = {
+            "tencent_doc_client_id",
+            "tencent_doc_open_id",
+            "tencent_doc_access_token",
+            "tencent_doc_default_file_id",
+            "subflow_data_dir",
+            "subflow_default_pipeline",
+        }
+        return {
+            k: (
+                None
+                if k not in _STR_FIELD_NAMES and isinstance(v, str) and v == ""
+                else v
+            )
+            for k, v in data.items()
+        }

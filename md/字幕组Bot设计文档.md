@@ -662,6 +662,8 @@ SUBFLOW_DEFAULT_PIPELINE=翻译[分段] → 时轴[分段] → 校对 → 后期
 
 `config.py` 使用 NoneBot2 标准的 Pydantic BaseSettings，从 `.env` 读取环境变量，类型校验失败时在启动阶段即报错。
 
+> **可选字段空值说明**：`.env` 中 `SUBFLOW_MAIN_GROUP_ID=` 这类可选字段留空即可，Bot 启动时 `Config` 模型会通过 `model_validator` 将空字符串转为 `None`，自动回退到字段默认值（见实现方案 D14）。无需手动删除或注释掉不需要的配置行。
+
 ---
 
 ### 5.4 部署方案
