@@ -387,9 +387,7 @@ class SubflowPlugin(Star):
         segment = args[3] if len(args) > 3 else None
 
         try:
-            summary = deps.require_task_manager().prepare_delete(
-                show=show_name, episode=episode, stage=stage, segment=segment
-            )
+            summary = deps.require_task_manager().delete_task(show_name, episode, stage, segment)
             msg = render.render_delete_summary(summary)
             # 保存待确认状态到 context 中
             key = f"confirm_delete_{self._get_user_id(event)}"
@@ -419,7 +417,7 @@ class SubflowPlugin(Star):
             return
 
         try:
-            outcome = deps.require_task_manager().execute_delete(**state)
+            outcome = deps.require_task_manager().confirm_pending(user_id)
             msg = render.render_delete_outcome(outcome)
             yield event.plain_result(msg)
         except (TaskError, PipelineError) as e:
@@ -512,7 +510,7 @@ class SubflowPlugin(Star):
         user_id = self._get_user_id(event)
 
         try:
-            outcome = deps.require_task_manager().claim(
+            outcome = deps.require_task_manager().claim_task(
                 show=show_name, episode=episode, stage=stage,
                 segment=segment, user_id=user_id,
             )
@@ -522,7 +520,7 @@ class SubflowPlugin(Star):
             yield event.plain_result(f"⚠️ {e}")
 
     @filter.command("完成")
-    async def complete(self, event: AstrMessageEvent):
+    async def complete_task(self, event: AstrMessageEvent):
         """完成任务"""
         if await self._reject_if_main_group(event):
             return
@@ -540,7 +538,7 @@ class SubflowPlugin(Star):
         user_id = self._get_user_id(event)
 
         try:
-            outcome = deps.require_task_manager().complete(
+            outcome = deps.require_task_manager().complete_task(
                 show=show_name, episode=episode, stage=stage,
                 segment=segment, user_id=user_id,
             )
@@ -551,7 +549,7 @@ class SubflowPlugin(Star):
             yield event.plain_result(f"⚠️ {e}")
 
     @filter.command("放弃")
-    async def abandon(self, event: AstrMessageEvent):
+    async def abandon_task(self, event: AstrMessageEvent):
         """放弃任务"""
         if await self._reject_if_main_group(event):
             return
@@ -569,7 +567,7 @@ class SubflowPlugin(Star):
         user_id = self._get_user_id(event)
 
         try:
-            outcome = deps.require_task_manager().abandon(
+            outcome = deps.require_task_manager().abandon_task(
                 show=show_name, episode=episode, stage=stage,
                 segment=segment, user_id=user_id,
             )
@@ -622,10 +620,8 @@ class SubflowPlugin(Star):
         episode = args[1] if len(args) > 1 else None
 
         try:
-            board = deps.require_task_manager().get_progress_board(
-                show=show_name, episode=episode
-            )
-            msg = render.render_progress_board(board)
+            board = deps.require_task_manager().list_episode(show=show_name, episode=episode)
+            msg = render.render_episode_board(records)
             yield event.plain_result(msg)
         except (TaskError, PipelineError) as e:
             yield event.plain_result(f"⚠️ {e}")
@@ -636,7 +632,7 @@ class SubflowPlugin(Star):
         user_id = self._get_user_id(event)
 
         try:
-            tasks = deps.require_task_manager().get_user_tasks(user_id)
+            tasks = deps.require_task_manager().list_my_tasks(user_id)
             if not tasks:
                 yield event.plain_result("你目前没有未完成任务")
                 return
@@ -652,7 +648,7 @@ class SubflowPlugin(Star):
         show_name = args[0] if args else None
 
         try:
-            tasks = deps.require_task_manager().get_pending_tasks(show=show_name)
+            tasks = deps.require_task_manager().list_available(show=show_name)
             if not tasks:
                 yield event.plain_result("当前没有待接任务" if not show_name else f"「{show_name}」没有待接任务")
                 return
