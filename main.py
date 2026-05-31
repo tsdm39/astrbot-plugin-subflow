@@ -115,13 +115,12 @@ class SubflowPlugin(Star):
         # TODO: 根据 AstrBot 的实际 API 补充群管检查
         return False
 
-    async def _reject_if_main_group(self, event: AstrMessageEvent) -> bool:
+    async def _reject_if_main_group(self, event: AstrMessageEvent) -> str | None:
         """D9：总群拒绝写操作。返回 True 表示已被拒绝（应终止处理）"""
         group_id = self._get_group_id(event)
         if group_id and deps.require_bindings().is_main_group(group_id):
-            yield event.plain_result("⚠️ 写操作请到对应工作群执行，总群仅支持查询")
-            return True
-        return False
+            return "⚠️ 写操作请到对应工作群执行，总群仅支持查询"
+        return None
 
     def _split_args(self, event: AstrMessageEvent) -> list[str]:
         """分割消息文本为参数列表"""
