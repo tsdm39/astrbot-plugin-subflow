@@ -44,8 +44,8 @@ class SubflowPlugin(Star):
 
         # 1. 读取配置（从环境变量，兼容原有 .env 格式）
         cfg_dict = {}
-        # 尝试读取 .env
-        env_path = Path(".") / ".env"
+        plugin_dir = Path(__file__).parent
+        env_path = plugin_dir / ".key"
         if env_path.exists():
             cfg_dict = load_env_file(env_path)
         # 环境变量覆盖
