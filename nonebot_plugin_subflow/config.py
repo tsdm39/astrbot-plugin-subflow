@@ -22,6 +22,14 @@ class TencentCreds:
     access_token: str
 
 
+class TencentDocKey(BaseModel):
+    """一套腾讯文档凭据（D18：多 key 轮换池里的一员）。"""
+
+    client_id: str
+    open_id: str
+    access_token: str
+
+
 def load_env_file(path: Path) -> dict[str, str]:
     """读 KEY=VALUE 格式的 .env，忽略空行/注释。"""
     env: dict[str, str] = {}
@@ -57,9 +65,14 @@ class Config(BaseModel):
     """NoneBot 插件配置。所有字段从 .env / 环境变量读取。"""
 
     # ──── 腾讯文档 API ────
-    tencent_doc_client_id: str
-    tencent_doc_open_id: str
-    tencent_doc_access_token: str
+    # D18：单一 JSON 列表为权威；留空则回退下面的三元组拼一个单 key
+    subflow_tencent_doc_keys: list[TencentDocKey] = Field(default_factory=list)
+    subflow_tencent_doc_rate_limit_rets: list[int] = Field(default_factory=list)
+    subflow_tencent_doc_key_cooldown: int = 60  # 限流命中后该 key 冷却秒数
+    # 单 key 兼容写法（软取代：仅当 subflow_tencent_doc_keys 为空时启用）
+    tencent_doc_client_id: str = ""
+    tencent_doc_open_id: str = ""
+    tencent_doc_access_token: str = ""
     tencent_doc_default_file_id: str = ""  # 默认文档 ID（未来按名绑定时查找子表用），M4 暂不强制
 
     # ──── 群配置 ────
@@ -101,3 +114,22 @@ class Config(BaseModel):
             )
             for k, v in data.items()
         }
+
+    @property
+    def resolved_keys(self) -> list[TencentDocKey]:
+        """D18：凭据池。列表非空则用列表；否则三元组都非空时拼单 key；都没有则空。"""
+        if self.subflow_tencent_doc_keys:
+            return list(self.subflow_tencent_doc_keys)
+        if (
+            self.tencent_doc_client_id
+            and self.tencent_doc_open_id
+            and self.tencent_doc_access_token
+        ):
+            return [
+                TencentDocKey(
+                    client_id=self.tencent_doc_client_id,
+                    open_id=self.tencent_doc_open_id,
+                    access_token=self.tencent_doc_access_token,
+                )
+            ]
+        return []

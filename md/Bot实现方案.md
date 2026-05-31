@@ -236,6 +236,31 @@ NoneBot2 通过 Pydantic BaseSettings 读取 `.env` 时，`KEY=` 得到的是空
 - `bindings.py`：`get_by_sheet(file_id, sheet_id)` 反查
 - `deps.py`：`_on_sync_changes` 回调接线（init 里 `cache.on_sync_changes = _on_sync_changes`）
 
+### D18 · 多套 API key 轮换池（追加，修订 D2）
+
+腾讯文档个人开发者额度 2000 次/天、按"开发者应用/账号"计。为支撑更多番剧 / 更短同步 / D17 等增量，给 storage 加**凭据池**：多套**已各自授权同一批文档**的 key 轮换使用，有效日额度叠到约 N×2000，并在某把 key token 失效/限流时自动转移。**前提**：多个独立开发者账号（不同 client_id/open_id），且每个都授权了同一批智能表；同账号多签 token 不叠加配额。这是纯 storage 层改动。
+
+经 grilling 敲定 8 条：
+
+1. **前提**：多独立账号、均授权同一批文档 → 配额可叠加。
+2. **轮换**：以每次调用 round-robin 为主（均摊日额度 + converter 的"300/周期 open_id"限制），叠加故障转移。
+3. **转移触发**：token 错（已知 `_TOKEN_ERROR_RETS`）→ 该 key 标 dead 出池、换把重试；限流 ret（命中**可配置码集合**）→ 该 key 短时冷却、换把；其它 `StorageError` 直接抛；未知 ret 显著 log 待上报。
+4. **配置形式**：单一 JSON 列表 `SUBFLOW_TENCENT_DOC_KEYS` 为权威。
+5. **迁移（软取代）**：列表为权威；空则回退老三元组拼单 key（`load_tencent_creds`/spike/集成测试不动）。三元组字段改为可选默认 `""`。
+6. **Token 校验（宽松）**：启动逐 key 解 JWT 查 exp，过期/无效的剔除+告警，≥1 把有效即启动，全无效才降级（缓存只读、写失败）。
+7. **池位置**：内置进 `TencentDocStorage`（凭据列表 + 轮换游标 + 每 key 健康态 `dead`/`cooldown_until`/`calls`），fields/fileID 缓存全池共享。
+8. **失败幂等**：只对 API 层拒绝（token/限流，执行前被拒）换把重试（最多扫一遍池）；网络层异常（超时/连接错，可能已落库）不自动重试写，直接抛。
+
+**边界**：converter 与业务端点共用轮换+转移；游标普通 int（单线程 asyncio、选 key 与进位间无 await，无需锁）；全 key 不可用 → token 全失效抛 `TokenExpiredError`、否则 `StorageError`；旧构造 `TencentDocStorage(client_id=,open_id=,access_token=)` 仍可用（size-1 池）。
+
+**待修改文件清单**：
+- `config.py`：`TencentDocKey` 模型；新增 `subflow_tencent_doc_keys` / `subflow_tencent_doc_rate_limit_rets` / `subflow_tencent_doc_key_cooldown`；三元组改默认 `""`；`resolved_keys` 属性
+- `storage/tencent_doc.py`：`_KeyState`；构造器接 `keys=` 或旧三元组 + `rate_limit_rets` + `key_cooldown_seconds`；`_pick_key` / `_headers_for` / `_request_with_failover`；`_call_sheet` / `convert_encoded_id` 走 failover 包装；删 `_headers` 属性
+- `deps.py`：逐 key 校验剔除、用有效子集（或全池）构造 storage、降级条件改 `if valid_keys`
+- `.env.example` / 文档：补三个新字段
+
+> **修订 D2**：token 模式从"单 token 启动检查/拒绝"改为"逐 key 校验、剔除无效、保留有效子集"；全部无效才进入与 D2 一致的降级。
+
 ---
 
 ## 三、项目结构（增量于原设计文档 5.2）
@@ -274,6 +299,11 @@ SUBFLOW_CONFIRM_TIMEOUT=30        # /删除任务 确认窗口秒数（D7）
 SUBFLOW_TOKEN_WARN_DAYS=7         # token 距过期多少天开始提醒（D2）
 SUBFLOW_NOTIFY_EXTERNAL_CHANGES=true            # 同步时检测人工直改表格并播报（D17）
 SUBFLOW_EXTERNAL_CHANGE_DIGEST_THRESHOLD=5      # 每群本轮变更 > 此数则汇总成一条（D17）
+
+# 多 key 轮换池（D18）—— 非空时取代上面的单 key 三元组
+SUBFLOW_TENCENT_DOC_KEYS=[]                      # [{client_id,open_id,access_token},...]
+SUBFLOW_TENCENT_DOC_RATE_LIMIT_RETS=[]          # 视为限流的 ret 码集合，观测到后填
+SUBFLOW_TENCENT_DOC_KEY_COOLDOWN=60             # 某 key 限流后冷却秒数
 ```
 
 ---

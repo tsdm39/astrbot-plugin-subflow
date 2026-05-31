@@ -1,14 +1,16 @@
-"""storage 层纯函数单元测试（不打网络）。"""
+"""storage 层单元测试（纯函数 + D18 多 key 池，均不打真实网络）。"""
 
 from __future__ import annotations
 
 from datetime import datetime
 
+import httpx
 import pytest
 
-from nonebot_plugin_subflow.exceptions import StorageError
+from nonebot_plugin_subflow.exceptions import StorageError, TokenExpiredError
 from nonebot_plugin_subflow.models import FieldSchema, Record
 from nonebot_plugin_subflow.storage.tencent_doc import (
+    TencentDocStorage,
     _parse_field,
     _parse_record,
     _unwrap_value,
@@ -186,3 +188,130 @@ def test_parse_record_normalizes_known_columns_and_keeps_unknown() -> None:
 def test_record_default_values_dict() -> None:
     rec = Record(record_id="r1")
     assert rec.values == {}
+
+
+# ---------------------------------------------------------- D18 多 key 轮换池
+
+
+TWO_KEYS = [
+    {"client_id": "c1", "open_id": "o1", "access_token": "t1"},
+    {"client_id": "c2", "open_id": "o2", "access_token": "t2"},
+]
+
+
+def _ok(payload: dict | None = None) -> httpx.Response:
+    return httpx.Response(200, json={"ret": 0, "data": payload or {"ok": 1}})
+
+
+def _err(ret: int) -> httpx.Response:
+    return httpx.Response(200, json={"ret": ret, "msg": f"err {ret}"})
+
+
+def _make_storage(handler, *, keys=TWO_KEYS, **kw) -> TencentDocStorage:
+    st = TencentDocStorage(keys=keys, **kw)
+    st._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))  # type: ignore[attr-defined]
+    return st
+
+
+async def test_pool_round_robin_rotates_open_id() -> None:
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("Open-Id", ""))
+        return _ok()
+
+    st = _make_storage(handler)
+    await st._call_sheet("F", "S", {"x": 1})
+    await st._call_sheet("F", "S", {"x": 2})
+    await st._call_sheet("F", "S", {"x": 3})
+    await st.aclose()
+    assert seen == ["o1", "o2", "o1"]  # 逐调用轮换
+
+
+async def test_pool_failover_on_token_error_marks_dead() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        # o1 的 token 失效，o2 正常
+        if request.headers.get("Open-Id") == "o1":
+            return _err(10011)  # token expired
+        return _ok()
+
+    st = _make_storage(handler)
+    data = await st._call_sheet("F", "S", {"x": 1})
+    assert data == {"ok": 1}
+    assert st._keys[0].dead is True  # o1 出池
+    assert st._keys[1].dead is False
+    # 后续调用直接跳过 dead 的 o1
+    seen: list[str] = []
+
+    def handler2(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("Open-Id", ""))
+        return _ok()
+
+    st._http = httpx.AsyncClient(transport=httpx.MockTransport(handler2))  # type: ignore[attr-defined]
+    await st._call_sheet("F", "S", {"x": 2})
+    await st.aclose()
+    assert seen == ["o2"]
+
+
+async def test_pool_failover_on_configured_rate_limit_cools_down() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.headers.get("Open-Id") == "o1":
+            return _err(9999)  # 配置内的限流码
+        return _ok()
+
+    st = _make_storage(handler, rate_limit_rets={9999}, key_cooldown_seconds=60)
+    data = await st._call_sheet("F", "S", {"x": 1})
+    await st.aclose()
+    assert data == {"ok": 1}
+    assert st._keys[0].cooldown_until is not None  # o1 进入冷却
+    assert st._keys[0].dead is False  # 限流不等于失效
+
+
+async def test_pool_does_not_failover_on_other_ret() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _err(500)  # 非 token、非配置限流
+
+    st = _make_storage(handler, rate_limit_rets={9999})
+    with pytest.raises(StorageError):
+        await st._call_sheet("F", "S", {"x": 1})
+    await st.aclose()
+    # 只试了第一把 key，没有转移
+    assert st._keys[0].calls == 1
+    assert st._keys[1].calls == 0
+
+
+async def test_pool_network_error_not_retried() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom")
+
+    st = _make_storage(handler)
+    with pytest.raises(httpx.ConnectError):
+        await st._call_sheet("F", "S", {"x": 1})
+    await st.aclose()
+    # 网络异常不换 key 重试（防重复落库）
+    assert st._keys[0].calls == 1
+    assert st._keys[1].calls == 0
+
+
+async def test_pool_all_keys_dead_raises_token_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _err(10011)  # 两把都 token 失效
+
+    st = _make_storage(handler)
+    with pytest.raises(TokenExpiredError):
+        await st._call_sheet("F", "S", {"x": 1})
+    await st.aclose()
+    assert all(k.dead for k in st._keys)
+
+
+async def test_legacy_single_key_constructor_still_works() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers.get("Open-Id") == "o"
+        return _ok()
+
+    st = TencentDocStorage(client_id="c", open_id="o", access_token="t")
+    st._http = httpx.AsyncClient(transport=httpx.MockTransport(handler))  # type: ignore[attr-defined]
+    data = await st._call_sheet("F", "S", {"x": 1})
+    await st.aclose()
+    assert data == {"ok": 1}
+    assert len(st._keys) == 1

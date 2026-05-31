@@ -10,8 +10,10 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime
-from typing import Any
+import logging
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from typing import Any, Awaitable, Callable
 
 import httpx
 
@@ -23,6 +25,21 @@ from ..exceptions import (
 )
 from ..models import FieldSchema, Record
 from .base import StorageBackend
+
+
+log = logging.getLogger(__name__)
+
+
+@dataclass
+class _KeyState:
+    """凭据池里的一套 key + 健康态（D18）。"""
+
+    client_id: str
+    open_id: str
+    access_token: str
+    dead: bool = False                    # token 失效，整轮出池（直到重启/续期）
+    cooldown_until: datetime | None = None  # 限流冷却到期时间
+    calls: int = 0                        # 已发起调用数（仅诊断）
 
 
 _FIELD_TYPE_MAP: dict[int, str] = {
@@ -50,14 +67,31 @@ class TencentDocStorage(StorageBackend):
     def __init__(
         self,
         *,
-        client_id: str,
-        open_id: str,
-        access_token: str,
+        keys: list[Any] | None = None,
+        client_id: str | None = None,
+        open_id: str | None = None,
+        access_token: str | None = None,
+        rate_limit_rets: set[int] | None = None,
+        key_cooldown_seconds: int = 60,
         timeout: float = 15.0,
     ) -> None:
-        self._client_id = client_id
-        self._open_id = open_id
-        self._access_token = access_token
+        """凭据池（D18）。
+
+        - 多 key：`keys=[TencentDocKey | dict | (client_id, open_id, access_token), ...]`
+        - 单 key 兼容：`client_id=/open_id=/access_token=`（包成 size-1 池）
+        """
+        if keys is None:
+            if not (client_id and open_id and access_token):
+                raise ValueError(
+                    "TencentDocStorage 需要 keys，或 client_id/open_id/access_token 三元组"
+                )
+            keys = [(client_id, open_id, access_token)]
+        self._keys: list[_KeyState] = [self._to_state(k) for k in keys]
+        if not self._keys:
+            raise ValueError("TencentDocStorage 至少需要一套凭据")
+        self._rate_limit_rets: set[int] = set(rate_limit_rets or ())
+        self._key_cooldown = timedelta(seconds=key_cooldown_seconds)
+        self._cursor = 0
         self._timeout = timeout
         self._http: httpx.AsyncClient | None = None
         self._fields_cache: dict[tuple[str, str], list[FieldSchema]] = {}
@@ -65,15 +99,78 @@ class TencentDocStorage(StorageBackend):
 
     # ------------------------------------------------------------------ infra
 
-    @property
-    def _headers(self) -> dict[str, str]:
+    @staticmethod
+    def _to_state(k: Any) -> _KeyState:
+        if isinstance(k, _KeyState):
+            return k
+        if isinstance(k, dict):
+            return _KeyState(k["client_id"], k["open_id"], k["access_token"])
+        if isinstance(k, (tuple, list)):
+            return _KeyState(k[0], k[1], k[2])
+        # duck-typed（如 config.TencentDocKey）
+        return _KeyState(k.client_id, k.open_id, k.access_token)
+
+    @staticmethod
+    def _headers_for(state: _KeyState) -> dict[str, str]:
         return {
-            "Access-Token": self._access_token,
-            "Client-Id": self._client_id,
-            "Open-Id": self._open_id,
+            "Access-Token": state.access_token,
+            "Client-Id": state.client_id,
+            "Open-Id": state.open_id,
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+
+    def _pick_key(self) -> _KeyState | None:
+        """从游标起 round-robin 找第一个可用（非 dead、未冷却）key 并进位；全不可用返回 None。"""
+        now = datetime.now()
+        n = len(self._keys)
+        for i in range(n):
+            idx = (self._cursor + i) % n
+            state = self._keys[idx]
+            if state.dead:
+                continue
+            if state.cooldown_until is not None:
+                if state.cooldown_until > now:
+                    continue
+                state.cooldown_until = None  # 冷却结束，恢复
+            self._cursor = (idx + 1) % n
+            return state
+        return None
+
+    async def _request_with_failover(
+        self, send: Callable[[dict[str, str]], Awaitable[httpx.Response]]
+    ) -> dict[str, Any]:
+        """选 key 发请求并解包；token/限流类拒绝换把重试（最多扫一遍池），网络异常直接抛。"""
+        last_exc: StorageError | None = None
+        for _ in range(len(self._keys)):
+            state = self._pick_key()
+            if state is None:
+                break
+            state.calls += 1
+            # 网络层异常（超时/连接错）在此抛出，不被捕获 → 直接冒泡，不重试（防重复落库）
+            resp = await send(self._headers_for(state))
+            try:
+                return self._handle(resp)
+            except TokenExpiredError as exc:
+                state.dead = True
+                last_exc = exc
+                log.warning(
+                    "腾讯文档 key（open_id=%s）token 失效，出池：%s", state.open_id, exc
+                )
+                continue
+            except StorageError as exc:
+                if exc.ret is not None and exc.ret in self._rate_limit_rets:
+                    state.cooldown_until = datetime.now() + self._key_cooldown
+                    last_exc = exc
+                    log.warning(
+                        "腾讯文档 key（open_id=%s）触发限流 ret=%s，冷却 %.0fs",
+                        state.open_id, exc.ret, self._key_cooldown.total_seconds(),
+                    )
+                    continue
+                raise  # 其它 API 错误（参数错/找不到/未知 ret）直接抛
+        if last_exc is not None:
+            raise last_exc
+        raise StorageError("无可用的腾讯文档凭据（全部 token 失效或限流冷却中）")
 
     async def _client(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
@@ -114,8 +211,11 @@ class TencentDocStorage(StorageBackend):
             file_id=file_id, sheet_id=sheet_id
         )
         client = await self._client()
-        resp = await client.post(url, headers=self._headers, json=body)
-        return self._handle(resp)
+
+        async def send(headers: dict[str, str]) -> httpx.Response:
+            return await client.post(url, headers=headers, json=body)
+
+        return await self._request_with_failover(send)
 
     # ------------------------------------------------------------------ converter
 
@@ -126,8 +226,11 @@ class TencentDocStorage(StorageBackend):
         url = self.BASE_URL + self._CONVERTER_ENDPOINT
         params = {"type": 2, "value": encoded_id}
         client = await self._client()
-        resp = await client.get(url, headers=self._headers, params=params)
-        data = self._handle(resp)
+
+        async def send(headers: dict[str, str]) -> httpx.Response:
+            return await client.get(url, headers=headers, params=params)
+
+        data = await self._request_with_failover(send)
         file_id = data["fileID"]
         self._fileid_cache[encoded_id] = file_id
         return file_id

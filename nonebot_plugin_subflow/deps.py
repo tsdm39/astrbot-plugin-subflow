@@ -39,29 +39,58 @@ async def init(cfg: Config) -> None:
     global config, storage, cache, bindings, pipelines, task_manager, token_check_result
 
     config = cfg
-    token_check_result = check_token_status(
-        cfg.tencent_doc_access_token,
-        warn_days=cfg.subflow_token_warn_days,
-    )
-    if token_check_result.status is TokenStatus.EXPIRED:
+
+    # D18：逐 key 校验 token，剔除过期/无效，保留有效子集
+    resolved = cfg.resolved_keys
+    valid_keys: list = []
+    token_check_result = None
+    if not resolved:
         log.error(
-            "腾讯文档 access_token 已过期（%s），将以降级模式启动 — 所有 API 操作都会失败",
-            token_check_result.expires_at,
+            "未配置任何腾讯文档凭据（SUBFLOW_TENCENT_DOC_KEYS 或 "
+            "TENCENT_DOC_CLIENT_ID/OPEN_ID/ACCESS_TOKEN），storage 将不可用"
         )
-    elif token_check_result.status is TokenStatus.EXPIRING_SOON:
-        log.warning(
-            "腾讯文档 access_token 将在 %s 后过期（%s）",
-            token_check_result.remaining,
-            token_check_result.expires_at,
+    for key in resolved:
+        try:
+            chk = check_token_status(
+                key.access_token, warn_days=cfg.subflow_token_warn_days
+            )
+        except Exception as exc:  # noqa: BLE001  非 JWT / 解析失败
+            log.error(
+                "腾讯文档 key（open_id=%s）token 无法解析，剔除：%s",
+                key.open_id, exc,
+            )
+            continue
+        if token_check_result is None:
+            token_check_result = chk
+        if chk.status is TokenStatus.EXPIRED:
+            log.error(
+                "腾讯文档 key（open_id=%s）token 已过期（%s），剔除出池",
+                key.open_id, chk.expires_at,
+            )
+            continue
+        if chk.status is TokenStatus.EXPIRING_SOON:
+            log.warning(
+                "腾讯文档 key（open_id=%s）token 将在 %s 后过期（%s）",
+                key.open_id, chk.remaining, chk.expires_at,
+            )
+        valid_keys.append(key)
+
+    if resolved and not valid_keys:
+        log.error(
+            "所有腾讯文档 key 的 token 均已过期/无效，将以降级模式启动 — 写操作会失败"
         )
 
     data_dir = Path(config.subflow_data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    storage = TencentDocStorage(
-        client_id=cfg.tencent_doc_client_id,
-        open_id=cfg.tencent_doc_open_id,
-        access_token=cfg.tencent_doc_access_token,
+    storage = (
+        TencentDocStorage(
+            keys=(valid_keys or resolved),
+            rate_limit_rets=set(cfg.subflow_tencent_doc_rate_limit_rets),
+            key_cooldown_seconds=cfg.subflow_tencent_doc_key_cooldown,
+        )
+        if resolved
+        else None
     )
     cache = SheetCache(
         storage, sync_interval_minutes=cfg.subflow_sync_interval
@@ -85,8 +114,8 @@ async def init(cfg: Config) -> None:
         confirm_timeout_seconds=cfg.subflow_confirm_timeout,
     )
 
-    # 装填缓存：所有已绑定子表全量拉一次
-    if token_check_result.status is not TokenStatus.EXPIRED:
+    # 装填缓存：有有效 key 才拉取 + 起定时同步；否则降级（查询走空缓存、写失败）
+    if valid_keys:
         for entry in bindings.list_all():
             try:
                 n = await cache.add_sheet(entry.file_id, entry.sheet_id)

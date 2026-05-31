@@ -64,7 +64,7 @@ cp .env.example .env
 cp docker-compose.yml.example docker-compose.yml
 ```
 
-编辑 `.env`：至少填 `TENCENT_DOC_CLIENT_ID` / `TENCENT_DOC_OPEN_ID` / `TENCENT_DOC_ACCESS_TOKEN`；其他按注释提示按需填。
+编辑 `.env`：至少填 `TENCENT_DOC_CLIENT_ID` / `TENCENT_DOC_OPEN_ID` / `TENCENT_DOC_ACCESS_TOKEN`（单 key），或改填 `SUBFLOW_TENCENT_DOC_KEYS` 多 key 数组（见下方「日常运维 · 提升日额度」）；其他按注释提示按需填。
 （`.env` 和 `docker-compose.yml` 都被 gitignore，本地版本随便改；upstream 模板只跟 `.example` 走。）
 
 ### 2. 在腾讯文档里准备智能表
@@ -196,9 +196,12 @@ docker compose up -d
 
 | 字段 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `TENCENT_DOC_CLIENT_ID` | ✓ | — | 开放平台应用 client_id |
-| `TENCENT_DOC_OPEN_ID` | ✓ | — | open_id |
-| `TENCENT_DOC_ACCESS_TOKEN` | ✓ | — | 30 天 JWT |
+| `TENCENT_DOC_CLIENT_ID` | △ | "" | 开放平台应用 client_id（单 key 写法；配了 `SUBFLOW_TENCENT_DOC_KEYS` 则可省） |
+| `TENCENT_DOC_OPEN_ID` | △ | "" | open_id（同上） |
+| `TENCENT_DOC_ACCESS_TOKEN` | △ | "" | 30 天 JWT（同上） |
+| `SUBFLOW_TENCENT_DOC_KEYS` | △ | `[]` | **多 key 轮换池**（D18），JSON 数组 `[{client_id,open_id,access_token},...]`；非空时取代上面三元组 |
+| `SUBFLOW_TENCENT_DOC_RATE_LIMIT_RETS` | | `[]` | 视为限流的 ret 码集合，命中则该 key 短时冷却+换把（腾讯未公布码，观测到后填） |
+| `SUBFLOW_TENCENT_DOC_KEY_COOLDOWN` | | 60 | 某 key 触发限流后的冷却秒数 |
 | `TENCENT_DOC_DEFAULT_FILE_ID` | △ | "" | 启用 `/绑定 <番剧名>`（按名查找子表）必填 |
 | `SUBFLOW_MAIN_GROUP_ID` | △ | None | 总群 QQ 群号，留空则不启用总群 |
 | `SUBFLOW_ADMIN_QQ_LIST` | △ | `[]` | 超管 QQ 列表，JSON 数组 |
@@ -223,8 +226,21 @@ docker compose up -d
 
 续期流程：
 1. 到开放平台后台重新生成 token
-2. 改 `.env` 里的 `TENCENT_DOC_ACCESS_TOKEN`
+2. 改 `.env` 里的 `TENCENT_DOC_ACCESS_TOKEN`（多 key 则改 `SUBFLOW_TENCENT_DOC_KEYS` 数组里对应那套）
 3. `docker compose restart nonebot`（`.env` 是文件挂载，restart 即可重读，无需 down+up）
+
+### 提升日额度（多 key 轮换池，D18）
+
+腾讯文档个人开发者额度 2000 次/天，按"开发者应用/账号"计。日常用量约 200~300/天，离上限很远；但若番剧数多、同步频繁，可配多套 key 把额度叠到约 N×2000：
+
+```env
+SUBFLOW_TENCENT_DOC_KEYS=[{"client_id":"c1","open_id":"o1","access_token":"t1"},{"client_id":"c2","open_id":"o2","access_token":"t2"}]
+```
+
+- **前提**：每套 key 背后是**不同的开发者账号**，且**都已被授权访问同一批智能表**（同账号多签 token 不叠加配额）。
+- Bot 每次 API 调用按 round-robin 轮换 key，均摊日额度；某把 key 的 token 失效会被自动剔除、限流则短时冷却，都会自动转移到下一把。
+- 启动时逐 key 校验 token：过期/无效的剔除并告警，只要还有 ≥1 把有效就正常启动；全部失效才降级（查询走缓存、写操作报错）。
+- `SUBFLOW_TENCENT_DOC_KEYS` 非空时取代单 key 三元组；留空则仍用三元组（向后兼容）。
 
 ### 备份
 
@@ -254,9 +270,9 @@ pytest
 pytest -m "not integration"
 ```
 
-测试覆盖 239 项，含：
+测试覆盖 250 项，含：
 - 全部 storage / cache / task_manager 业务路径
-- D3 提醒文案、D5 并发锁、D6 归一化、D7 二次确认过期、D10 流水线快照隔离、D15 接活/完成前置语义、D16 艾特码渲染、D17 外部变更检测与提醒
+- D3 提醒文案、D5 并发锁、D6 归一化、D7 二次确认过期、D10 流水线快照隔离、D15 接活/完成前置语义、D16 艾特码渲染、D17 外部变更检测与提醒、D18 多 key 轮换/故障转移
 - 6 项打真实腾讯文档 API 的端到端集成测试
 
 ---
