@@ -3,6 +3,7 @@
 把 task_manager 的 Outcome 翻译成 QQ 消息文本（含 CQ 码 @ 段）。
 所有渲染是纯函数，方便单元测试。
 """
+from __future__ import annotations
 
 # ★★★ 添加以下兼容代码，让原 NoneBot Message/MessageSegment 在 AstrBot 下也能工作 ★★★
 def Message(text=""):
@@ -18,8 +19,6 @@ class MessageSegment:
     def at(qq) -> str:
         return f"[CQ:at,qq={qq}]"
 # ★★★ 兼容代码结束 ★★★
-
-from __future__ import annotations
 
 from datetime import datetime
 from typing import Iterable
