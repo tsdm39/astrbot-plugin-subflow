@@ -81,7 +81,7 @@ class SubflowPlugin(Star):
         cfg_dict = {k.lower(): v for k, v in cfg_dict.items()}
         import json
 
-        # 将可能为JSON字符串的字段解析为Python对象
+    # 将可能为JSON字符串的字段解析为Python对象
         list_fields = [
             'subflow_tencent_doc_keys',
             'subflow_tencent_doc_rate_limit_rets',
@@ -594,7 +594,7 @@ class SubflowPlugin(Star):
         try:
             outcome = deps.require_task_manager().claim_task(
                 show=show_name, episode=episode, stage=stage,
-                segment=segment, user_id=user_id,
+                segment=segment, user_qq=user_id,
             )
             msg = render.render_claim_outcome(outcome)
             yield event.plain_result(msg)
@@ -627,7 +627,7 @@ class SubflowPlugin(Star):
         try:
             outcome = deps.require_task_manager().complete_task(
                 show=show_name, episode=episode, stage=stage,
-                segment=segment, user_id=user_id,
+                segment=segment, user_qq=user_id,
             )
             msgs = render.render_complete_outcome(outcome)
             for msg in msgs if isinstance(msgs, list) else [msgs]:
@@ -661,7 +661,7 @@ class SubflowPlugin(Star):
         try:
             outcome = deps.require_task_manager().abandon_task(
                 show=show_name, episode=episode, stage=stage,
-                segment=segment, user_id=user_id,
+                segment=segment, user_qq=user_id,
             )
             msg = render.render_abandon_outcome(outcome)
             yield event.plain_result(msg)
@@ -694,7 +694,7 @@ class SubflowPlugin(Star):
         try:
             outcome = deps.require_task_manager().set_in_progress(
                 show=show_name, episode=episode, stage=stage,
-                segment=segment, user_id=user_id,
+                segment=segment, user_qq=user_id,
             )
             msg = render.render_in_progress_outcome(outcome)
             yield event.plain_result(msg)
