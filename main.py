@@ -74,6 +74,7 @@ class SubflowPlugin(Star):
                 cfg_dict[key.lower()] = env_val
 
         from .config import Config
+        cfg_dict = {k.lower(): v for k, v in cfg_dict.items()}
         config = Config(**cfg_dict)
         log.info("subflow 配置加载完成")
 
